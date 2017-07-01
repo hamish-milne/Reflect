@@ -8,17 +8,17 @@ namespace ReflectTest
 {
 	internal class FooClass
 	{
-		internal void Foo(int a, BarClass bar)
+		private void Foo(int a, BarClass bar)
 		{
 			Console.WriteLine($"{a} {bar.Bar(a)}");
 		}
 
-		internal void Baz(out object baz)
+		private void Baz(out object baz)
 		{
 			baz = new BarClass();
 		}
 
-		internal static FooClass Property { get; } = new FooClass();
+		private static FooClass Property { get; } = new FooClass();
 	}
 
 	internal class BarClass
@@ -27,11 +27,13 @@ namespace ReflectTest
 		{
 			return b + 1;
 		}
+
+		internal BarClass() { }
 	}
 
 	public delegate void OutVar<T>(out T value);
 
-	[ReflectedType("ReflectTest.FooClass")]
+	[ReflectedType("ReflectTest.FooClass", typeof(RFooClass))]
 	public class RFooClass : Reflect.Reflect
 	{
 		public readonly Action<int, RBarClass> Foo;
@@ -43,7 +45,7 @@ namespace ReflectTest
 		public RFooClass(object instance = null) : base(instance) { }
 	}
 
-	[ReflectedType("ReflectTest.BarClass")]
+	[ReflectedType("ReflectTest.BarClass", typeof(RFooClass))]
 	public class RBarClass : Reflect.Reflect
 	{
 		public readonly Func<int, int> Bar;
