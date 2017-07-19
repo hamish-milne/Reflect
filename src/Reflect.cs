@@ -1,15 +1,52 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
 
 namespace Reflect
 {
-#if !NETSTANDARD
+
+#if NET35 || NET40
+	// ReSharper disable once RedundantNameQualifier
 	using TypeInfo = System.Type;
+#endif
+
 	internal static class TypeInfoEx
 	{
+#if NETSTANDARD1_0
+		public static FieldInfo GetField(this TypeInfo type, string name)
+			=> type.GetDeclaredField(name);
+
+		public static ConstructorInfo GetConstructor(this TypeInfo type, Type[] arguments)
+			=> type.DeclaredConstructors
+			.FirstOrDefault(c => c.GetParameters().Select(p => p.ParameterType)
+				.SequenceEqual(arguments));
+
+		public static MethodInfo GetMethod(this TypeInfo type, string name)
+			=> type.GetDeclaredMethod(name);
+
+		public static IEnumerable<FieldInfo> GetFields(this Type type)
+			=> type.GetRuntimeFields();
+
+		public static bool IsInstanceOfType(this TypeInfo type, object obj)
+			=> type.IsAssignableFrom(obj.GetType().GetTypeInfo());
+
+		public static ConstructorInfo[] GetDeclaredConstructors(this TypeInfo type)
+			=> type.DeclaredConstructors.ToArray();
+
+		public static object CreateInstance(this TypeInfo type)
+			=> type.GetConstructor(new Type[0]).Invoke(null);
+
+		public static FieldInfo GetPrivateField(this Type type, string name)
+			=> type.GetTypeInfo().GetField(name);
+
+		public static MethodInfo GetMethod(this TypeInfo type, string name, Type[] parameters)
+			=> type.AsType().GetRuntimeMethod(name, parameters);
+#else
+
+#if NET35 || NET40
 		public static Type GetTypeInfo(this Type type)
 			=> type;
 
@@ -43,55 +80,39 @@ namespace Reflect
 				BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static |
 				BindingFlags.DeclaredOnly);
 
-		public static ConstructorInfo[] GetDeclaredConstructors(this Type type)
-			=> type.GetConstructors(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-
 		public static IEnumerable<MethodInfo> GetRuntimeMethods(this Type type)
 			=> type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
 
+#endif
+
+		public static ConstructorInfo[] GetDeclaredConstructors(this Type type)
+			=> type.GetConstructors(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
 		public static object CreateInstance(this Type type)
 			=> Activator.CreateInstance(type, true);
-	}
-#endif
 
-#if NETSTANDARD
-
-	internal static class TypeInfoEx
-	{
-		public static FieldInfo GetField(this TypeInfo type, string name)
-			=> type.GetDeclaredField(name);
-
-		public static ConstructorInfo GetConstructor(this TypeInfo type, Type[] arguments)
-			=> type.DeclaredConstructors
-			.FirstOrDefault(c => c.GetParameters().Select(p => p.ParameterType)
-				.SequenceEqual(arguments));
-
-		public static MethodInfo GetMethod(this TypeInfo type, string name, Type[] parameters)
-			=> type.AsType().GetRuntimeMethod(name, parameters);
-
-		public static MethodInfo GetMethod(this TypeInfo type, string name)
-			=> type.GetDeclaredMethod(name);
-
-		public static IEnumerable<FieldInfo> GetFields(this Type type)
-			=> type.GetRuntimeFields();
-
-		public static bool IsInstanceOfType(this TypeInfo type, object obj)
-			=> type.IsAssignableFrom(obj.GetType().GetTypeInfo());
-
-		public static ConstructorInfo[] GetDeclaredConstructors(this TypeInfo type)
-			=> type.DeclaredConstructors.ToArray();
-
-		public static object CreateInstance(this TypeInfo type)
-			=> type.GetConstructor(new Type[0]).Invoke((object[])null);
-	}
+		public static FieldInfo GetPrivateField(this Type type, string name)
+			=> type.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
 
 #endif
+	}
 
 	/// <summary>
 	/// Apply to a method stub to look for a constructor rather than a method
 	/// </summary>
 	[AttributeUsage(AttributeTargets.Field)]
 	public class ConstructorAttribute : Attribute { }
+
+	// Currently it is not possible to create a dynamic method with a ref return, so this feature doesn't work
+	// It can be re-enabled if and when this oversight is fixed
+	/*
+	/// <summary>
+	/// Use this delegate to reflect a field of compatible type `T`
+	/// </summary>
+	/// <typeparam name="T"></typeparam>
+	/// <returns></returns>
+	public delegate ref T FieldStub<T>();
+	*/
 
 	/// <summary>
 	/// Apply to a concrete suclass of <c>Reflect</c> to set the type it will reflect over
@@ -116,7 +137,7 @@ namespace Reflect
 	/// <summary>
 	/// Base class for reflection stubs. Inherit and apply the <c>ReflectedTypeAttribute</c>.
 	/// </summary>
-	public abstract class Reflect
+	public abstract class ReflectStub
 	{
 		// Caches method references and instance delegate creators to generally speed up
 		// the creation of new objects
@@ -130,20 +151,39 @@ namespace Reflect
 			public TypeCache(TypeInfo type)
 			{
 				Ctors = type.GetDeclaredConstructors();
-				InstanceMethods = type.AsType().GetRuntimeMethods().Where(m => !m.IsAbstract && !m.IsStatic).ToArray();
-				StaticMethods = type.AsType().GetRuntimeMethods().Where(m => !m.IsAbstract && m.IsStatic).ToArray();
+				InstanceMethods = type.AsType().GetRuntimeMethods().Where(m => !m.IsStatic).ToArray();
+				StaticMethods = type.AsType().GetRuntimeMethods().Where(m => m.IsStatic).ToArray();
 			}
 		}
 
 		// Map of reflected types to type caches
-		private static readonly Dictionary<TypeInfo, TypeCache> Cache = new Dictionary<TypeInfo, TypeCache>();
+		private static readonly Dictionary<Type, TypeCache> Cache = new Dictionary<Type, TypeCache>();
+
+		// Set of types that have been initialized, so we can check later
+		private static readonly HashSet<Type> InitializedTypes = new HashSet<Type>();
+
+		// A map of stub types to reflected types for quick access
+		private static readonly Dictionary<Type, TypeInfo> ReflectedTypes = new Dictionary<Type, TypeInfo>();
+
+		// Cache of stub type constructors used for conversion operations
+		private static readonly Dictionary<Type, ConstructorInfo> StubConstructors = new Dictionary<Type, ConstructorInfo>();
 
 		// Gets a type cache for the reflected type
-		private TypeCache GetTypeCache()
+		private static TypeCache GetTypeCache(Type stubType)
 		{
-			if(!Cache.TryGetValue(_type, out var tc))
-				Cache.Add(_type, tc = new TypeCache(_type));
+			if(!Cache.TryGetValue(stubType, out var tc))
+				Cache.Add(stubType, tc = new TypeCache(GetReflectedType(stubType)));
 			return tc;
+		}
+
+		private static ConstructorInfo GetStubCtor(Type stubType)
+		{
+			var ti = stubType.GetTypeInfo();
+			if(ti.IsAbstract) throw new Exception($"A stub return type was requested, but {stubType} is abstract");
+			if(!StubConstructors.TryGetValue(stubType, out var ctor))
+				StubConstructors.Add(stubType, ctor = ti.GetConstructor(new[] { typeof(object) }));
+			if(ctor == null) throw new Exception($"The stub type {stubType} does not implement a constructor that accepts an object argument");
+			return ctor;
 		}
 
 		// Map of reflected types to method stub fields
@@ -151,46 +191,50 @@ namespace Reflect
 
 		// The reflected instance
 		private readonly object _instance;
-		// The reflected type
-		private readonly TypeInfo _type;
-		// The stub type's constructor, for reflection interop
-		private readonly ConstructorInfo _ctor;
 
 		// The `_instance` field, for reflection interop
 		private static readonly FieldInfo InstanceField =
-			typeof(Reflect).GetTypeInfo().GetField(nameof(_instance));
+			typeof(ReflectStub).GetPrivateField(nameof(_instance));
 
 		/// <summary>
 		/// Gets the reflected instance for the given stub instance
 		/// </summary>
 		/// <param name="r">The stub instance, or <c>null</c></param>
 		/// <returns>The reflected instance, or <c>null</c></returns>
-		public static object GetInstance(Reflect r) => r?._instance;
+		public static object GetInstance(ReflectStub r) => r?._instance;
 
 		/// <summary>
 		/// Gets the reflected type for the given stub instance
 		/// </summary>
 		/// <param name="r">The stub instance, or <c>null</c></param>
 		/// <returns>The reflected type, or <c>null</c></returns>
-		public static TypeInfo GetType(Reflect r) => r?._type;
+		public static TypeInfo GetReflectedType(ReflectStub r) => ReflectedTypes[r.GetType()];
 
 		/// <summary>
 		/// Gets the reflected type for the given stub type
 		/// </summary>
-		/// <param name="rType">The stub type</param>
+		/// <param name="stubType">The stub type</param>
 		/// <param name="exception">If <c>true</c>, throw an exception if a reflected type could not be found</param>
 		/// <returns>The reflected type</returns>
-		public static TypeInfo GetType(TypeInfo rType, bool exception = true)
+		public static TypeInfo GetReflectedType(Type stubType, bool exception = true)
 		{
-			var attr = rType.GetCustomAttribute<ReflectedTypeAttribute>();
-			if (attr == null)
+			if (!ReflectedTypes.TryGetValue(stubType, out var rType))
 			{
-				if (exception) throw new Exception($"Reflect type {rType} has no ReflectedTypeAttribute");
-				return null;
+				var attr = stubType.GetTypeInfo().GetCustomAttribute<ReflectedTypeAttribute>();
+				if (attr == null)
+				{
+					if (exception) throw new Exception($"Stub type {stubType} has no ReflectedTypeAttribute");
+				}
+				else
+				{
+					var type = attr.Type ?? GetType(attr.TypeName, attr.AssemblyType?.GetTypeInfo().Assembly);
+					if (type == null && exception)
+						throw new Exception($"Attribute for {stubType} does not define reflected type");
+					rType = type.GetTypeInfo();
+				}
+				ReflectedTypes.Add(stubType, rType);
 			}
-			var type = attr.Type ?? GetType(attr.TypeName, attr.AssemblyType?.GetTypeInfo().Assembly);
-			if(type == null && exception) throw new Exception($"Attribute for {rType} does not define reflected type");
-			return type.GetTypeInfo();
+			return rType;
 		}
 		
 		// Gets a type by name
@@ -198,7 +242,7 @@ namespace Reflect
 		{
 			if (assembly != null)
 				return assembly.GetType(type);
-#if NETSTANDARD
+#if NETSTANDARD1_0
 			throw new Exception(".NET Core requires specifying an assembly type to load by name");
 #else
 			return AppDomain.CurrentDomain.GetAssemblies().Select(a =>
@@ -219,14 +263,16 @@ namespace Reflect
 		/// Creates a new instance, optionally passing in an existing reflected instance
 		/// </summary>
 		/// <param name="instance">An existing instance, or <c>null</c> to create a new one</param>
-		protected Reflect(object instance = null)
+		protected ReflectStub(object instance = null)
 		{
-			_type = GetType(GetType().GetTypeInfo());
-			_instance = instance ?? (_type.IsAbstract ? null : _type.CreateInstance());
-			_ctor = GetType().GetTypeInfo().GetConstructor(new[] { typeof(object) });
-			if(!_type.IsInstanceOfType(_instance))
-				throw new Exception($"The given object {_instance} is not an instance of reflected type {_type}");
-			Initialize();
+			var rType = GetReflectedType(GetType());
+			InitializeStatic(rType.AsType());
+			_instance = instance ?? (rType.IsAbstract ? null : rType.CreateInstance());
+			if(_instance == null)
+				throw new Exception($"Cannot create a reflected instance of an abstract type {rType}");
+			if(!rType.IsInstanceOfType(_instance))
+				throw new Exception($"The given object {_instance} is not an instance of reflected type {rType}");
+			InitializeInstance();
 		}
 
 		/// <summary>
@@ -237,11 +283,8 @@ namespace Reflect
 		public override bool Equals(object obj)
 		{
 			if (ReferenceEquals(this, obj)) return true;
-			var other = obj as Reflect;
-			if (other == null || (other._instance == null) != (_instance == null)) return false;
-			if (_instance == null)
-				return other._type == _type;
-			return _instance.Equals(other._instance);
+			var other = obj as ReflectStub;
+			return other != null && _instance.Equals(other._instance);
 		}
 
 		/// <summary>
@@ -250,33 +293,68 @@ namespace Reflect
 		/// <returns></returns>
 		public override int GetHashCode()
 		{
-			return (_instance ?? _type).GetHashCode();
+			return (_instance ?? GetReflectedType(GetType())).GetHashCode();
+		}
+
+		private static FieldInfo[] GetAllFields(Type type)
+		{
+			if (!ValidFieldsCache.TryGetValue(type, out var fields))
+			{
+				fields = type.GetRuntimeFields()
+					.Where(f => f.DeclaringType != null && f.DeclaringType.GetTypeInfo().IsSubclassOf(typeof(ReflectStub)))
+					.Where(f => f.FieldType.GetTypeInfo().IsSubclassOf(typeof(Delegate)))
+					.ToArray();
+				ValidFieldsCache.Add(type, fields);
+			}
+			return fields;
 		}
 
 		// Sets the values of all stub fields
-		private void Initialize()
+		private void InitializeInstance()
 		{
-			if (!ValidFieldsCache.TryGetValue(GetType(), out var fields))
+			foreach (var f in GetAllFields(GetType()))
 			{
-				fields = GetType().GetRuntimeFields()
-					.Where(f => f.DeclaringType != null && f.DeclaringType.GetTypeInfo().IsSubclassOf(typeof(Reflect)))
-					.Where(f => f.FieldType.GetTypeInfo().IsSubclassOf(typeof(Delegate)))
-					.ToArray();
-				ValidFieldsCache.Add(GetType(), fields);
-			}
-			foreach (var f in fields)
-			{
-				if (f.GetValue(this) != null) continue;
-				var del = f.IsDefined(typeof(ConstructorAttribute)) ? GetCtor(f) : GetDelegate(f);
-				f.SetValue(this, del);
+				if (f.IsStatic || f.GetValue(this) != null) continue;
+				if(f.IsDefined(typeof(ConstructorAttribute)))
+					throw new Exception("Constructor stubs must be static");
+				if(_instance == null) throw new Exception($"No instance provided for non-static field {f}");
+				f.SetValue(this, GetDelegate(f, GetType(), _instance));
 			}
 		}
 
-		// Checks if a candidate parameter matches the desired stub one
-		private static bool ValidParameter(ParameterInfo desired, ParameterInfo candidate)
+		/// <summary>
+		/// Initializes static fields for the given type
+		/// </summary>
+		/// <param name="type"></param>
+		protected static void InitializeStatic(Type type)
 		{
+			if (!InitializedTypes.Add(type)) return;
+			foreach (var f in GetAllFields(type))
+			{
+				if (!f.IsStatic || f.GetValue(null) != null) continue;
+				var del = f.IsDefined(typeof(ConstructorAttribute)) ? GetCtor(f, type) : GetDelegate(f, type, null);
+				f.SetValue(null, del);
+			}
+		}
+
+		protected static void InitializeStatic()
+		{
+			var frame = new StackFrame(1);
+			var type = frame.GetMethod().DeclaringType;
+			InitializeStatic(type);
+		}
+
+		// Checks if a candidate parameter matches the desired stub one
+		private static bool ValidParameter(ParameterInfo desired, ParameterInfo candidate/*, ref bool requiresRefCast*/)
+		{
+			if (desired.ParameterType == candidate.ParameterType) return true;
 			var desiredType = desired.ParameterType.GetTypeInfo();
 			var candidateType = candidate.ParameterType.GetTypeInfo();
+
+#if NET35
+			if(desiredType.IsByRef)
+				throw new Exception("ByRef arguments are not supported in .NET 3.5 unless the signature is exact");
+#endif
 
 			// Check for direct assignment capability
 			var isAssignable = desired.Position < 0
@@ -285,32 +363,51 @@ namespace Reflect
 			if (isAssignable)
 				return true;
 
-/*#if NETSTANDARD
+			#if !NET35
 			// For the case of 'ref' or 'out' parameters
 			if (candidate.ParameterType.IsByRef)
 			{
 				if (!desired.ParameterType.IsByRef) return false;
 				if (desired.IsOut != candidate.IsOut) return false;
-				// We've already checked the simple case where both types are public
-				// so we can assume that the desired type is a Reflect subclass
-				var tDesired = GetType(desired.ParameterType.GetElementType().GetTypeInfo(), false);
-				var tCandidate = candidate.ParameterType.GetElementType().GetTypeInfo();
-				if (tDesired == null || tCandidate == null) return false;
-				// For 'out' parameters, the invokee can be a subclass
-				if (desired.IsOut)
-					return tDesired.IsAssignableFrom(tCandidate);
-				// for 'ref' parameters, they need to be identical
-				return tDesired.AsType() == tCandidate.AsType();
+
+				var tDesiredElement = desiredType.GetElementType();
+				var tCandidateElement = candidateType.GetElementType();
+
+				if (tDesiredElement == tCandidateElement) return true;
+				if (tDesiredElement.GetTypeInfo().IsAssignableFrom(tCandidateElement.GetTypeInfo()))
+				{
+					//requiresRefCast |= !desired.IsOut;
+					return true;
+				}
+
+				if (desiredType.IsSubclassOf(typeof(ReflectStub)))
+				{
+					var tDesired = GetReflectedType(desired.ParameterType.GetElementType(), false);
+					var tCandidate = candidate.ParameterType.GetElementType().GetTypeInfo();
+					if (tDesired == null || tCandidate == null) return false;
+					// For 'out' parameters, the invokee can be a subclass
+					if (desired.IsOut)
+						return tDesired.IsAssignableFrom(tCandidate);
+					// for 'ref' parameters, they need to be identical
+					return tDesired.AsType() == tCandidate.AsType();
+				}
 			}
-#endif*/
+			#endif
 
 			// It might also be valid if we're passing in a Reflect object
-			if (!desiredType.IsSubclassOf(typeof(Reflect))) return false;
-			var reflectedType = GetType(desiredType);
-			if (desired.Position < 0)
-				return reflectedType.IsAssignableFrom(candidateType);
-			else
-				return candidateType.IsAssignableFrom(reflectedType);
+			if (desiredType.IsSubclassOf(typeof(ReflectStub)))
+			{
+				var reflectedType = GetReflectedType(desiredType.AsType());
+				if (desired.Position < 0)
+					return reflectedType.IsAssignableFrom(candidateType);
+				else
+					return candidateType.IsAssignableFrom(reflectedType);
+			}
+
+			// Finally, we might be using an interface with less-derived types (i.e. object)
+			return desired.Position < 0
+				? desiredType.IsSubclassOf(candidateType)
+				: candidateType.IsSubclassOf(desiredType);
 		}
 
 		// Finds a candidate method from a list
@@ -339,108 +436,175 @@ namespace Reflect
 			return null;
 		}
 
-		// Creates a casting expression from an input, given a parameter
-		private static Expression GetCastExpression(Expression e, ParameterInfo arg)
+		// Creates a casting expression from an input expression to a given target type
+		private static Expression GetCastExpression(Expression e, Type to)
 		{
-			var targetType = arg.ParameterType;
-			var eType = arg.ParameterType.IsByRef ? e.Type.MakeByRefType() : e.Type; 
-			if (eType == targetType) return e;
-			if (eType.GetTypeInfo().IsSubclassOf(typeof(Reflect)))
+			var targetType = to.GetTypeInfo();
+			var eType = e.Type;
+			if (to.IsByRef && !eType.IsByRef) eType = e.Type.GetTypeInfo().MakeByRefType();
+			if (eType == to || targetType.IsAssignableFrom(eType.GetTypeInfo())) return e;
+			if (targetType.IsSubclassOf(typeof(ReflectStub)))
+				return Expression.New(GetStubCtor(to), e);
+			if (eType.GetTypeInfo().IsSubclassOf(typeof(ReflectStub)) && targetType.IsAssignableFrom(GetReflectedType(eType)))
 				e = Expression.Field(e, InstanceField);
-			if (eType.GetTypeInfo().IsAssignableFrom(targetType.GetTypeInfo())) return e;
-			return Expression.Convert(e, targetType);
+			return Expression.Convert(e, to);
 		}
 
 		// Gets a constructor delegate from the given stub field
-		private Delegate GetCtor(FieldInfo field)
+		private static Delegate GetCtor(FieldInfo field, Type stubType)
 		{
+			var rType = GetReflectedType(stubType);
+			if(rType.IsAbstract) throw new Exception("abstract/static types cannot have constructor stubs");
+
 			var invokeMethod = field.FieldType.GetTypeInfo().GetDeclaredMethod("Invoke");
 			var args = invokeMethod.GetParameters();
 
 			// Find a method that matches the exact signature
-			var method = _type.GetConstructor(args.Select(p => p.ParameterType).ToArray());
-			var exprArgs = args.Select(p => Expression.Parameter(p.ParameterType, p.Name)).Cast<Expression>().ToArray();
+			var tc = GetTypeCache(stubType);
+			var pTypes = args.Select(p => p.ParameterType).ToArray();
+			var method = tc.Ctors.FirstOrDefault(c => c.GetParameters().Select(p => p.ParameterType).SequenceEqual(pTypes));
+			var lambdaParams = args.Select(p => Expression.Parameter(p.ParameterType, p.Name)).ToArray();
+			// ReSharper disable once CoVariantArrayConversion
+			Expression[] exprArgs = lambdaParams;
 
 			if (method == null)
 			{
-				method = FindCandidateMethod(GetTypeCache().Ctors, args, out var foundArgs);
+				method = FindCandidateMethod(GetTypeCache(stubType).Ctors, args, out var foundArgs);
 				if(method == null)
 					throw new Exception($"Unable to find candidate method for {field}");
-				exprArgs = exprArgs.Select((e,i) => GetCastExpression(e, foundArgs[i])).ToArray();
+				exprArgs = exprArgs.Select((e,i) => GetCastExpression(e, foundArgs[i].ParameterType)).ToArray();
 			}
-
-			// ReSharper disable once RedundantCast
-			var exprNew = Expression.New(method, (Expression[])exprArgs);
+			
+			var exprNew = Expression.New(method, exprArgs);
 			var returnType = invokeMethod.ReturnType.GetTypeInfo();
 			if (!returnType.IsAssignableFrom(exprNew.Type.GetTypeInfo()))
 			{
-				if(!returnType.IsAssignableFrom(_type))
+				if(!returnType.IsAssignableFrom(stubType))
 					throw new Exception($"Constructor stub {field} has an invalid return type");
-				if (_ctor == null)
-					throw new Exception($"The Reflect type {GetType()} has no constructor taking an object instance argument");
-				exprNew = Expression.New(_ctor, exprNew);
+				exprNew = Expression.New(GetStubCtor(stubType), exprNew);
 			}
-			return Expression.Lambda(field.FieldType, exprNew).Compile();
+			return Expression.Lambda(field.FieldType, exprNew, lambdaParams).Compile();
 		}
+
+		// Currently it is not possible to create a dynamic method with a ref return, so this feature doesn't work
+		// It can be re-enabled if and when this oversight is fixed
+		/*
+		private static ref T ReturnRef<T>(ref T input) => ref input;
+
+		private static Func<object, Delegate> FieldDelegateCreator(FieldInfo field, Type stubType)
+		{
+			// Find a field with the right name
+			var rType = GetReflectedType(stubType);
+			// We assume that the given field is of type `FieldStub<T>`; this check should be done by the caller
+			var fType = field.FieldType.GetTypeInfo().GenericTypeArguments[0];
+
+			var candidate = rType.AsType().GetPrivateField(field.Name);
+			if (fType != candidate.FieldType)
+				throw new Exception($"The type of field access stub {field} must be exactly that of reflected field {candidate}");
+
+			var returnRef = typeof(ReflectStub).GetTypeInfo().GetDeclaredMethod(nameof(ReturnRef)).MakeGenericMethod(fType);
+			return o =>
+			{
+				Expression expr = Expression.Field(Expression.Constant(o, rType.AsType()), candidate);
+				expr = Expression.Call(returnRef, expr);
+				return Expression.Lambda(field.FieldType, expr).Compile();
+			};
+		}
+		*/
 
 		// Gets a delegate creator from a field stub.
 		// Instance delegates may need to be created multiple times; by storing these creator methods we can skip a lot of the code the next time
-		private Func<object, Delegate> GetDelegateCreator(FieldInfo field)
+		private static Func<object, Delegate> GetDelegateCreator(FieldInfo field, Type stubType)
 		{
-			var invokeMethod = field.FieldType.GetTypeInfo().GetMethod("Invoke");
+			var rType = GetReflectedType(stubType);
+			var fType = field.FieldType;
+			var invokeMethod = fType.GetTypeInfo().GetMethod("Invoke");
 			var args = invokeMethod.GetParameters();
 
 			// Find a method that matches the exact signature
-			var method = _type.GetMethod(field.Name, args.Select(p => p.ParameterType).ToArray());
+			var tc = GetTypeCache(stubType);
+			var methodList = field.IsStatic ? tc.StaticMethods : tc.InstanceMethods;
+			var pTypes = args.Select(p => p.ParameterType).ToArray();
+			var method = methodList.FirstOrDefault(m => m.Name == field.Name && m.GetParameters().Select(p => p.ParameterType).SequenceEqual(pTypes));
 
 			// If the method exists, use it
 			if (method != null && method.ReturnType == invokeMethod.ReturnType)
 			{
+				// ReSharper disable RedundantAssignment
+				invokeMethod = null;
+				rType = null;
+				// ReSharper restore RedundantAssignment
 				if (field.IsStatic)
-					return o => method.CreateDelegate(field.FieldType);
+					return o => method.CreateDelegate(fType);
 				else
-					return o => method.CreateDelegate(field.FieldType, o);
+					return o => method.CreateDelegate(fType, o);
 			}
 
 			// Otherwise, find a compatible method and compile an expression
-			var tc = GetTypeCache();
-			method = FindCandidateMethod(field.IsStatic ? tc.StaticMethods : tc.InstanceMethods, args, out var foundArgs, invokeMethod.ReturnParameter);
+			method = FindCandidateMethod(methodList, args, out var foundArgs, invokeMethod.ReturnParameter);
 			if(method == null)
 				throw new Exception($"Unable to find candidate method for {field}");
 
 			var exprArgs = args.Select(p => Expression.Parameter(p.ParameterType, p.Name)).ToArray();
-			var exprCast = exprArgs.Select((e,i) => GetCastExpression(e, foundArgs[i])).ToArray();
+			var exprCast = exprArgs.Select((e,i) => GetCastExpression(e, foundArgs[i].ParameterType)).ToArray();
 
+#if NET35
 			return o =>
 			{
 				Expression exprCall = method.IsStatic ? Expression.Call(method, exprCast) :
-					Expression.Call(Expression.Constant(o, _type.AsType()), method, exprCast);
+					Expression.Call(Expression.Constant(o, rType.AsType()), method, exprCast);
 				if (!exprCall.Type.GetTypeInfo().IsAssignableFrom(invokeMethod.ReturnType.GetTypeInfo()))
 				{
-					if (GetType(invokeMethod.ReturnType.GetTypeInfo(), false)?.IsAssignableFrom(exprCall.Type.GetTypeInfo()) == true)
+					if (GetReflectedType(invokeMethod.ReturnType, false)?.IsAssignableFrom(exprCall.Type.GetTypeInfo()) == true)
 					{
-						if (_ctor == null)
-							throw new Exception($"The Reflect type {GetType()} has no constructor taking an object instance argument");
-						exprCall = Expression.New(_ctor, exprCall);
+						exprCall = Expression.New(GetStubCtor(invokeMethod.ReturnType), exprCall);
 					}
 					else
 						exprCall = Expression.Convert(exprCall, invokeMethod.ReturnType);
 				}
-				return Expression.Lambda(field.FieldType, exprCall, exprArgs).Compile();
+				return Expression.Lambda(fType, exprCall, exprArgs).Compile();
 			};
+#else
+
+			// Assign input arguments to variables of the correct type
+			var variables = foundArgs.Select((p, i) =>
+					Expression.Variable(p.ParameterType.IsByRef ? p.ParameterType.GetElementType() : p.ParameterType, "_" + p.Name)).ToArray();
+			var assignments = variables.Select((v, i) => Expression.Assign(v, exprCast[i]));
+			return o =>
+			{
+				// Call the method
+				// ReSharper disable CoVariantArrayConversion
+				Expression exprCall = method.IsStatic ? Expression.Call(method, variables) :
+					Expression.Call(Expression.Constant(o, rType.AsType()), method, variables);
+				// ReSharper restore CoVariantArrayConversion
+
+				// Cast the arguments back to the inputs
+				var assignBack = exprArgs.Where(a => a.IsByRef)
+					.Select(a => Expression.Assign(a, GetCastExpression(variables[Array.IndexOf(exprArgs, a)], a.Type)));
+				var castReturn = GetCastExpression(exprCall, invokeMethod.ReturnType);
+
+				return Expression.Lambda(fType,
+					Expression.Block(variables, assignments.Concat(new[] {exprCall}).Concat(assignBack)
+						.Concat(new[] {castReturn})), exprArgs).Compile();
+			};
+#endif
 		}
 
 		// Gets a delegate from a field stub, using a cached creator if it exists
-		private Delegate GetDelegate(FieldInfo field)
+		private static Delegate GetDelegate(FieldInfo field, Type stubType, object instance)
 		{
-			var tc = GetTypeCache();
+			var tc = GetTypeCache(stubType);
 			if (!tc.Creators.TryGetValue(field, out var creator))
 			{
-				creator = GetDelegateCreator(field);
+				// Currently it is not possible to create a dynamic method with a ref return, so this feature doesn't work
+				// It can be re-enabled if and when this oversight is fixed
+				/*bool isFieldAccess = field.FieldType.IsConstructedGenericType &&
+								 field.FieldType.GetGenericTypeDefinition() == typeof(FieldStub<>);*/
+				creator = /*isFieldAccess ? FieldDelegateCreator(field, stubType) :*/ GetDelegateCreator(field, stubType);
 				if(!field.IsStatic)
 					tc.Creators.Add(field, creator);
 			}
-			return creator(field.IsStatic ? null : _instance);
+			return creator(field.IsStatic ? null : instance);
 		}
 	}
 }

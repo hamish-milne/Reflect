@@ -1,4 +1,8 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup Condition="'$(Platform)'=='Standard 1.0'">
+	<TargetFramework>netstandard1.0</TargetFramework>
+  </PropertyGroup>
   
   <PropertyGroup Condition="'$(Platform)'=='.NET 3.5'">
 	<TargetFramework>net35</TargetFramework>
@@ -13,18 +17,8 @@
   </PropertyGroup>
 
   <PropertyGroup>
-    <OutputType>Library</OutputType>
-    <ApplicationIcon />
-    <OutputTypeEx>library</OutputTypeEx>
-    <StartupObject />
+    <AssemblyName>Reflect</AssemblyName>
+    <RootNamespace>Reflect</RootNamespace>
   </PropertyGroup>
 
-  <ItemGroup>
-    <PackageReference Include="NUnit" Version="3.7.1" />
-    <PackageReference Include="NUnit3TestAdapter" Version="3.7.0" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="..\src\Reflect.csproj" />
-  </ItemGroup>
 </Project>
